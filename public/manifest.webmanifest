@@ -1,0 +1,22 @@
+{
+  "name": "File Beacon",
+  "short_name": "Beacon",
+  "description": "Beam files directly between two browsers. One code, no uploads.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0C0F0D",
+  "theme_color": "#0C0F0D",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "share_target": {
+    "action": "/share-target",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "files": [
+        { "name": "files", "accept": ["*/*"] }
+      ]
+    }
+  }
+}

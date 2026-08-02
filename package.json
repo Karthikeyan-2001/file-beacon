@@ -1,0 +1,13 @@
+{
+  "name": "file-beacon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Peer-to-peer file beaming: WebSocket signaling, WebRTC data-channel transfer. No file bytes ever touch the server.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

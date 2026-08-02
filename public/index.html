@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File Beacon: beam files browser to browser</title>
+<meta name="description" content="Beam files directly between two browsers. One code, no accounts, no uploads.">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#0C0F0D">
+<script>
+/* Set the theme before first paint to avoid a flash of the wrong mode.
+   Dark is the default; the toggle persists an explicit choice. */
+(function () {
+  var t = localStorage.getItem('beacon-theme');
+  if (t !== 'light' && t !== 'dark') t = 'dark';
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62.5..125,300..800&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-state="idle">
+
+<header class="masthead">
+  <p class="wordmark"><span class="wordmark-glyph" aria-hidden="true"></span>FILE BEACON</p>
+  <div class="masthead-side">
+    <p class="statusline">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status-text">Idle</span>
+    </p>
+    <button id="btn-theme" class="btn-theme" type="button" aria-label="Switch theme">Light</button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ============================================= idle / landing -->
+  <section id="view-gate" class="view view-landing">
+    <div class="hero">
+      <div class="hero-copy">
+        <h1 class="display">Beam files<br>device to device.</h1>
+        <p class="lede">One four-digit code links two browsers directly.
+          No accounts, no uploads, no cloud copy.</p>
+
+        <div class="gate-actions">
+          <div class="gate-host">
+            <button id="btn-host" class="btn btn-primary" type="button">Start sharing</button>
+            <p class="hint">You get a code to read to the other device.</p>
+          </div>
+
+          <form id="join-form" class="gate-join" novalidate>
+            <label for="join-code">Have a code?</label>
+            <div class="join-row">
+              <input id="join-code" name="code" type="text" inputmode="numeric"
+                     autocomplete="one-time-code" pattern="\d{4}" maxlength="4"
+                     placeholder="0000" aria-describedby="gate-error">
+              <button class="btn" type="submit">Join</button>
+            </div>
+          </form>
+        </div>
+
+        <p id="gate-error" class="error-line" role="alert" hidden></p>
+        <p id="support-warning" class="error-line" role="alert" hidden></p>
+      </div>
+
+      <div class="radar" aria-hidden="true">
+        <span class="radar-ring r1"></span>
+        <span class="radar-ring r2"></span>
+        <span class="radar-ring r3"></span>
+        <span class="radar-grid-h"></span>
+        <span class="radar-grid-v"></span>
+        <span class="radar-sweep"></span>
+        <span class="radar-core"></span>
+      </div>
+    </div>
+
+    <section class="landing-section" aria-labelledby="hd-how">
+      <h2 class="section-title" id="hd-how">How it works</h2>
+      <ol class="steps">
+        <li>
+          <span class="step-num" aria-hidden="true">1</span>
+          <h3>Start a room</h3>
+          <p>One device gets a four-digit code. It lives for five minutes.</p>
+        </li>
+        <li>
+          <span class="step-num" aria-hidden="true">2</span>
+          <h3>Enter the code</h3>
+          <p>The other device types it in. The two browsers link directly.</p>
+        </li>
+        <li>
+          <span class="step-num" aria-hidden="true">3</span>
+          <h3>Drop files</h3>
+          <p>Either side can send. Bytes travel straight across, both ways at once.</p>
+        </li>
+      </ol>
+    </section>
+
+    <section class="landing-section" aria-labelledby="hd-privacy">
+      <h2 class="section-title statement" id="hd-privacy">Your files never touch a&nbsp;server.</h2>
+      <p class="prose">The server hands out the code and relays a few kilobytes of
+        connection setup. The files themselves move over an encrypted WebRTC channel,
+        browser to browser. You could pull the server's plug mid-transfer and the file
+        would still arrive. Rooms expire after five minutes, codes are single-use, and
+        nothing is written to disk in between.</p>
+    </section>
+
+    <section class="landing-section" aria-labelledby="hd-practical">
+      <h2 class="section-title" id="hd-practical">Common questions</h2>
+      <dl class="qa">
+        <div class="qa-row">
+          <dt>Lots of devices on one Wi&#8209;Fi?</dt>
+          <dd>No problem. Any number of devices can have this page open at once.
+            Each code pairs exactly two of them in a private room, and a third
+            device entering a used code is politely turned away. On the same
+            Wi&#8209;Fi, transfers take the local path and run at network speed.</dd>
+        </div>
+        <div class="qa-row">
+          <dt>How big can files be?</dt>
+          <dd>Hundreds of megabytes are fine and won't freeze the tab. The
+            receiving browser holds a file in memory until it's saved, so the
+            practical ceiling is the receiver's free RAM.</dd>
+        </div>
+        <div class="qa-row">
+          <dt>Is it encrypted?</dt>
+          <dd>Always. WebRTC channels are end-to-end encrypted with DTLS. It
+            cannot be switched off.</dd>
+        </div>
+        <div class="qa-row">
+          <dt>What can block it?</dt>
+          <dd>Both tabs must stay open during a transfer. There is no cloud copy,
+            that's the point. Very strict corporate networks can prevent a direct
+            link; if that happens the app says so plainly instead of spinning
+            forever.</dd>
+        </div>
+      </dl>
+    </section>
+  </section>
+
+  <!-- ============================================= hosting / waiting -->
+  <section id="view-lobby" class="view" hidden>
+    <p class="label">Your room code</p>
+    <p class="code" id="code-display" aria-live="off"></p>
+    <div class="lobby-row">
+      <button id="btn-copy" class="btn" type="button">Copy code</button>
+      <p class="waiting"><span class="pulse" aria-hidden="true"></span>
+        <span id="waiting-text">Waiting for your peer</span>
+        <span id="ttl" class="ttl"></span></p>
+    </div>
+    <button id="btn-cancel-host" class="btn btn-quiet" type="button">Cancel</button>
+  </section>
+
+  <!-- ============================================= linking handshake -->
+  <section id="view-link" class="view" hidden>
+    <p class="label">Handshake</p>
+    <p class="display display-small" id="link-text">Peer found.<br>Linking devices&hellip;</p>
+    <p class="hint">Negotiating a direct connection. This usually takes a second or two.</p>
+  </section>
+
+  <!-- ============================================= connected session -->
+  <section id="view-session" class="view" hidden>
+    <div class="session-head">
+      <p class="label">Linked directly to</p>
+      <p class="peer-desc" id="peer-desc">a device</p>
+    </div>
+
+    <div id="dropzone" class="dropzone">
+      <input type="file" id="file-input" multiple class="visually-hidden"
+             aria-label="Choose files to send">
+      <button id="btn-browse" class="btn btn-primary" type="button">Choose files to send</button>
+      <p class="dropzone-hint" id="dropzone-hint">or drop them anywhere on this page</p>
+    </div>
+
+    <ul id="transfers" class="transfers" aria-label="File transfers"></ul>
+
+    <button id="btn-leave" class="btn btn-quiet" type="button">Disconnect</button>
+  </section>
+
+  <!-- ============================================= ended / failed -->
+  <section id="view-dead" class="view" hidden>
+    <p class="label">Session over</p>
+    <p class="display display-small" id="dead-text">The other device disconnected.</p>
+    <button id="btn-restart" class="btn btn-primary" type="button">Start over</button>
+  </section>
+
+</main>
+
+<footer class="colophon">
+  <p>Files move device to device over WebRTC. The server only makes the introduction.</p>
+  <a class="credit" href="https://karthikeyanj.com" target="_blank" rel="noopener">Made by Karthikeyan&nbsp;J</a>
+</footer>
+
+<div id="live" class="visually-hidden" aria-live="polite"></div>
+
+<template id="tpl-transfer">
+  <li class="transfer" data-status="queued">
+    <div class="ring-wrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <svg class="ring" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+        <circle class="ring-track" cx="24" cy="24" r="20"></circle>
+        <circle class="ring-fill" cx="24" cy="24" r="20"></circle>
+      </svg>
+      <span class="ring-pct" aria-hidden="true">0</span>
+    </div>
+    <div class="transfer-body">
+      <p class="transfer-name"></p>
+      <p class="transfer-meta">
+        <span class="transfer-dir"></span>
+        <span class="transfer-size"></span>
+        <span class="transfer-stats"></span>
+      </p>
+    </div>
+    <div class="transfer-actions">
+      <a class="transfer-save" hidden download>Save</a>
+      <button class="btn btn-small transfer-retry" type="button" hidden>Retry</button>
+      <button class="btn btn-small transfer-cancel" type="button">Cancel</button>
+    </div>
+  </li>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>
