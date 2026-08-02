@@ -110,25 +110,48 @@ function fmtClock(ms) {
 }
 
 // ------------------------------------------------------------ signaling
-function openSignaling() {
+function connectSocketOnce() {
   return new Promise((resolve, reject) => {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const sock = new WebSocket(`${proto}://${location.host}`);
-    sock.onopen = () => resolve(sock);
-    sock.onerror = () => reject(new Error('signaling-unreachable'));
-    sock.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
-      handleSignalMessage(msg);
-    };
-    sock.onclose = () => {
-      // Only fatal if we were mid-pairing; once WebRTC is up the socket is optional.
-      if (appState === 'hosting' || appState === 'joining' || appState === 'connecting') {
-        fail('Lost the signaling connection before the peers could link.');
-      }
-    };
-    ws = sock;
+    let settled = false;
+    sock.onopen = () => { settled = true; resolve(sock); };
+    sock.onerror = () => { if (!settled) { settled = true; reject(new Error('signaling-unreachable')); } };
+    sock.onclose = () => { if (!settled) { settled = true; reject(new Error('signaling-unreachable')); } };
   });
+}
+
+// Some hosts (free-tier proxies included) drop the occasional WebSocket
+// upgrade for no real reason. A handshake that fails once is often fine on
+// the next try, so retry a few times with backoff before telling the user
+// their network is the problem.
+const SIGNAL_RETRY_DELAYS_MS = [0, 500, 1500];
+
+async function openSignaling() {
+  let lastErr;
+  for (const delay of SIGNAL_RETRY_DELAYS_MS) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    try {
+      const sock = await connectSocketOnce();
+      sock.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        handleSignalMessage(msg);
+      };
+      sock.onerror = () => {}; // post-connect transport errors surface via onclose
+      sock.onclose = () => {
+        // Only fatal if we were mid-pairing; once WebRTC is up the socket is optional.
+        if (appState === 'hosting' || appState === 'joining' || appState === 'connecting') {
+          fail('Lost the signaling connection before the peers could link.');
+        }
+      };
+      ws = sock;
+      return sock;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 function sig(msg) {
