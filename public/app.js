@@ -721,9 +721,11 @@ $('#btn-restart').addEventListener('click', () => {
   $('#btn-host').focus();
 });
 
-// file picking (keyboard-first: a real button + hidden input)
+// file picking: a <label for="file-input"> triggers the native picker
+// directly (no JS forwarding, so it can't be broken by browser-specific
+// click() timing/activation rules). Keyboard access comes for free too:
+// the hidden input stays in the tab order and Enter/Space opens it.
 const fileInput = $('#file-input');
-$('#btn-browse').addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
   enqueueFiles(fileInput.files);
   fileInput.value = '';

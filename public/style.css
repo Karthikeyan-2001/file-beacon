@@ -189,6 +189,7 @@ main { flex: 1; display: flex; }
 
 /* --------------------------------------------------------------- buttons */
 .btn {
+  display: inline-block; /* normalizes box model whether it's a <button> or a <label> */
   font: 600 0.8125rem/1 var(--font-m);
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -219,6 +220,14 @@ main { flex: 1; display: flex; }
 .btn-small { padding: 0.55em 0.95em; font-size: 0.6875rem; }
 
 :is(button, a, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* The real file input is visually hidden, so its own focus-visible ring
+   (above) is invisible. Project it onto the label that triggers it instead,
+   so keyboard users tabbing to "Choose files to send" still see a ring. */
+#file-input:focus-visible + label {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
