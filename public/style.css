@@ -281,7 +281,12 @@ main { flex: 1; display: flex; }
 #join-code {
   font: 600 1.4rem/1 var(--font-m);
   letter-spacing: 0.35em;
-  width: 6.5ch;
+  /* Sized from the actual text metrics rather than a guessed ch count:
+     4 glyphs (1ch each in a monospace face) + the 0.35em of tracking that
+     follows every one of them, incl. the last + the left inset. box-sizing
+     is border-box globally, so padding has to be inside this figure. The
+     trailing 0.5em is slack for the caret. */
+  width: calc(4ch + (4 * 0.35em) + 0.35em + 0.5em);
   padding: 0.45em 0 0.45em 0.35em;
   background: transparent;
   border: none;
