@@ -7,9 +7,12 @@
 'use strict';
 
 // ------------------------------------------------------------ constants
-const CHUNK_SIZE = 64 * 1024;              // 64 KiB slices
-const HIGH_WATER = 1 * 1024 * 1024;        // pause sending above 1 MiB buffered
-const LOW_WATER = 256 * 1024;              // resume below 256 KiB
+const CHUNK_SIZE = 64 * 1024;              // 64 KiB slices (clamped to the peer's maxMessageSize)
+// Chrome's internal send buffer tops out near 16 MiB. Keeping a deep queue lets
+// SCTP stay saturated; the old 1 MiB mark forced a drain round-trip every ~16
+// chunks, and each of those is a full event-loop hop with the link idle.
+const HIGH_WATER = 8 * 1024 * 1024;        // pause sending above 8 MiB buffered
+const LOW_WATER = 1 * 1024 * 1024;         // resume below 1 MiB
 const CONNECT_TIMEOUT_MS = 20 * 1000;
 const STALL_TIMEOUT_MS = 20 * 1000;
 const GRACE_MS = 6 * 1000; // recovery window for a transient 'disconnected'
@@ -424,18 +427,7 @@ async function pumpQueue() {
   dc.send(JSON.stringify({ t: 'meta', id: item.id, name: item.name, size: item.size, mime: item.file.type || 'application/octet-stream' }));
 
   try {
-    let offset = 0;
-    while (offset < item.size) {
-      if (item.status === 'cancelled') break;
-      if (!dc || dc.readyState !== 'open') throw new Error('channel-closed');
-      if (dc.bufferedAmount > HIGH_WATER) await waitForDrain();
-      const buf = await item.file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
-      if (item.status === 'cancelled') break;
-      dc.send(buf);
-      offset += buf.byteLength;
-      item.done = offset;
-      updateProgress(item);
-    }
+    if (item.size > 0) await sendFileBody(item);
     if (item.status !== 'cancelled') {
       dc.send(JSON.stringify({ t: 'done', id: item.id }));
       // Completion is confirmed by the receiver's 'received' ack.
@@ -448,6 +440,53 @@ async function pumpQueue() {
   } finally {
     sending = null;
     pumpQueue();
+  }
+}
+
+// Largest message this peer connection will accept. Chrome caps at 256 KiB,
+// Firefox goes far higher; clamp our own preference to whatever was negotiated.
+function negotiatedChunkSize() {
+  const max = (pc && pc.sctp && pc.sctp.maxMessageSize) || 0;
+  return max > 0 ? Math.min(CHUNK_SIZE, max) : CHUNK_SIZE;
+}
+
+// Reads the file as a sequential stream rather than issuing an independent
+// random-access .slice() read per chunk.
+//
+// The old approach serialized disk and network: read 64 KiB, send it, read the
+// next 64 KiB, send it. Nothing overlapped, so the link sat idle during every
+// read. That's invisible for an in-memory Blob but brutal for a real file on a
+// phone, where each read is a fresh seek into (on Android) a Storage Access
+// Framework handle with IPC cost per call. A multi-GB video ends up dominated
+// by read latency, not bandwidth.
+//
+// Blob.stream() keeps one handle open, reads forward, and buffers ahead, so
+// reads overlap with sends instead of blocking them.
+async function sendFileBody(item) {
+  const maxChunk = negotiatedChunkSize();
+  const reader = item.file.stream().getReader();
+  try {
+    while (true) {
+      if (item.status === 'cancelled') return;
+      const { done, value } = await reader.read();
+      if (done) return;
+      const view = value instanceof Uint8Array ? value : new Uint8Array(value);
+      // Stream chunk sizes are up to the browser, so re-cut to the negotiated
+      // limit. The receiver just appends bytes, so boundaries needn't be uniform.
+      let off = 0;
+      while (off < view.byteLength) {
+        if (item.status === 'cancelled') return;
+        if (!dc || dc.readyState !== 'open') throw new Error('channel-closed');
+        if (dc.bufferedAmount > HIGH_WATER) await waitForDrain();
+        const end = Math.min(off + maxChunk, view.byteLength);
+        dc.send(view.buffer.slice(view.byteOffset + off, view.byteOffset + end));
+        item.done += end - off;
+        off = end;
+        updateProgress(item);
+      }
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
   }
 }
 
