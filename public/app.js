@@ -293,6 +293,43 @@ async function onRemoteSignal(d) {
   }
 }
 
+// Surfaces what chrome://webrtc-internals would otherwise require digging
+// through: whether the two peers actually found each other directly on the
+// local network, or had to route through NAT over the open internet. That
+// distinction is usually the real explanation for "why is this slow".
+async function reportConnectionType() {
+  const el = $('#conn-type');
+  if (!el || !pc) return;
+  try {
+    const stats = await pc.getStats();
+    let pair = null;
+    stats.forEach((r) => {
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) pair = r;
+    });
+    if (!pair) { el.textContent = ''; return; }
+    let local = null, remote = null;
+    stats.forEach((r) => {
+      if (r.id === pair.localCandidateId) local = r;
+      if (r.id === pair.remoteCandidateId) remote = r;
+    });
+    const isDirect = local && remote && local.candidateType === 'host' && remote.candidateType === 'host';
+    const isRelayed = (local && local.candidateType === 'relay') || (remote && remote.candidateType === 'relay');
+    el.classList.remove('conn-direct', 'conn-routed');
+    if (isDirect) {
+      el.textContent = 'Direct connection on your local network';
+      el.classList.add('conn-direct');
+    } else if (isRelayed) {
+      el.textContent = 'Relayed through a TURN server, not a direct link';
+      el.classList.add('conn-routed');
+    } else {
+      el.textContent = 'Routed over the internet through NAT, not a direct local link';
+      el.classList.add('conn-routed');
+    }
+  } catch {
+    el.textContent = '';
+  }
+}
+
 function wireDataChannel() {
   dc.binaryType = 'arraybuffer';
   dc.bufferedAmountLowThreshold = LOW_WATER;
@@ -301,6 +338,7 @@ function wireDataChannel() {
     clearTimeout(connectTimer);
     setState('connected');
     announce(`Connected to ${$('#peer-desc').textContent}. You can now send files.`);
+    reportConnectionType();
     if (pendingSharedFiles.length) {
       enqueueFiles(pendingSharedFiles);
       pendingSharedFiles = [];
@@ -343,6 +381,8 @@ function cleanupPeer() {
   sending = null;
   receiving = null;
   sendQueue = [];
+  const connTypeEl = $('#conn-type');
+  if (connTypeEl) { connTypeEl.textContent = ''; connTypeEl.classList.remove('conn-direct', 'conn-routed'); }
 }
 
 // --------------------------------------------------------- send pipeline

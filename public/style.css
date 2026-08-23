@@ -480,6 +480,30 @@ main { flex: 1; display: flex; }
   text-transform: uppercase;
 }
 
+.conn-type {
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  color: var(--soft);
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+}
+
+.conn-type::before {
+  content: "";
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  background: var(--soft);
+  flex-shrink: 0;
+}
+
+.conn-type.conn-direct { color: var(--accent); }
+.conn-type.conn-direct::before { background: var(--accent); }
+
+.conn-type.conn-routed { color: var(--amber); }
+.conn-type.conn-routed::before { background: var(--amber); }
+
 /* radar-target corner brackets, colored by connection state */
 .dropzone {
   position: relative;
