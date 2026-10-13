@@ -7,12 +7,23 @@
 'use strict';
 
 // ------------------------------------------------------------ constants
-const CHUNK_SIZE = 64 * 1024;              // 64 KiB slices (clamped to the peer's maxMessageSize)
+// 256 KiB is Chrome's advertised SCTP max-message-size (clamped to whatever the
+// peer negotiated). At 64 KiB a 30 MB/s link meant ~500 send() calls and ~500
+// onmessage events per second on a phone's main thread; 4x larger messages cut
+// that per-message overhead 4x on both ends.
+const CHUNK_SIZE = 256 * 1024;
 // Chrome's internal send buffer tops out near 16 MiB. Keeping a deep queue lets
 // SCTP stay saturated; the old 1 MiB mark forced a drain round-trip every ~16
 // chunks, and each of those is a full event-loop hop with the link idle.
 const HIGH_WATER = 8 * 1024 * 1024;        // pause sending above 8 MiB buffered
-const LOW_WATER = 1 * 1024 * 1024;         // resume below 1 MiB
+// Resume with plenty still queued, so SCTP never runs dry while a mobile main
+// thread takes its time delivering the bufferedamountlow event.
+const LOW_WATER = 4 * 1024 * 1024;
+// Receiver folds raw ArrayBuffers into a Blob every 16 MiB. Blob data lives in
+// the browser's blob store (which can page to disk) instead of the JS heap, so a
+// large file doesn't drive a phone tab into GC thrash or an out-of-memory kill.
+const SPILL_BYTES = 16 * 1024 * 1024;
+const PROGRESS_INTERVAL_MS = 150;          // UI repaint cadence during a transfer
 const CONNECT_TIMEOUT_MS = 20 * 1000;
 const STALL_TIMEOUT_MS = 20 * 1000;
 const GRACE_MS = 6 * 1000; // recovery window for a transient 'disconnected'
@@ -512,7 +523,7 @@ function handleControl(msg) {
       // Protocol guard: a new file announced while one is mid-receive means the
       // streams desynced. Fail the old transfer instead of corrupting both.
       if (receiving && receiving.status === 'active') {
-        receiving.chunks = [];
+        dropReceived(receiving);
         setItemStatus(receiving, 'failed');
       }
       const item = {
@@ -521,7 +532,9 @@ function handleControl(msg) {
         name: String(msg.name || 'file').replace(/[/\\]/g, '_'),
         size: Number(msg.size) || 0,
         mime: msg.mime,
-        chunks: [],
+        parts: [],     // Blobs already folded out of the JS heap
+        chunks: [],    // raw ArrayBuffers since the last fold
+        pending: 0,    // bytes held in chunks
         done: 0,
         status: 'active',
         samples: [],
@@ -556,7 +569,7 @@ function handleControl(msg) {
       const item = transfers.get(msg.id);
       if (!item || item.status === 'complete') break;
       setItemStatus(item, 'cancelled');
-      if (item.dir === 'recv') { item.chunks = []; if (receiving === item) receiving = null; }
+      if (item.dir === 'recv') { dropReceived(item); if (receiving === item) receiving = null; }
       if (sending === item) item.status = 'cancelled'; // send loop checks this flag
       announce(`${item.name} was cancelled by the other device.`);
       break;
@@ -568,16 +581,28 @@ function handleChunk(buf) {
   const item = receiving;
   if (!item || item.status !== 'active') return; // late chunks after cancel: drop
   item.chunks.push(buf);
+  item.pending += buf.byteLength;
+  if (item.pending >= SPILL_BYTES) {
+    item.parts.push(new Blob(item.chunks));
+    item.chunks = [];
+    item.pending = 0;
+  }
   item.done += buf.byteLength;
   item.lastChunkAt = performance.now();
   updateProgress(item);
   if (item.done >= item.size) finalizeReceive(item);
 }
 
+function dropReceived(item) {
+  item.parts = [];
+  item.chunks = [];
+  item.pending = 0;
+}
+
 function finalizeReceive(item) {
   receiving = null;
-  const blob = new Blob(item.chunks, { type: item.mime || 'application/octet-stream' });
-  item.chunks = [];
+  const blob = new Blob(item.parts.concat(item.chunks), { type: item.mime || 'application/octet-stream' });
+  dropReceived(item);
   const url = URL.createObjectURL(blob);
   const el = item.el;
   const save = el.querySelector('.transfer-save');
@@ -596,7 +621,7 @@ setInterval(() => {
       performance.now() - receiving.lastChunkAt > STALL_TIMEOUT_MS) {
     const item = receiving;
     receiving = null;
-    item.chunks = [];
+    dropReceived(item);
     setItemStatus(item, 'failed');
     announce(`Receiving ${item.name} stalled and was stopped.`);
   }
@@ -644,12 +669,18 @@ function setRing(item, pct) {
   wrap.setAttribute('aria-valuetext', `${Math.floor(pct)} percent`);
 }
 
+// Called once per chunk, but only touches the DOM every PROGRESS_INTERVAL_MS.
+// Repainting the SVG ring, stats text and ARIA attributes on every message cost
+// the main thread more than the transfer itself on mid-range phones.
 function updateProgress(item) {
+  const now = performance.now();
+  if (now - (item.lastPaint || 0) < PROGRESS_INTERVAL_MS && item.done < item.size) return;
+  item.lastPaint = now;
+
   const pct = item.size ? (item.done / item.size) * 100 : 100;
   setRing(item, pct);
 
   // rolling 3-second window for speed
-  const now = performance.now();
   item.samples.push([now, item.done]);
   while (item.samples.length > 2 && now - item.samples[0][0] > 3000) item.samples.shift();
   const [t0, b0] = item.samples[0];
@@ -672,7 +703,7 @@ function updateProgress(item) {
 function cancelTransfer(item) {
   if (item.status !== 'queued' && item.status !== 'active') return;
   setItemStatus(item, 'cancelled');
-  if (item.dir === 'recv') { item.chunks = []; if (receiving === item) receiving = null; }
+  if (item.dir === 'recv') { dropReceived(item); if (receiving === item) receiving = null; }
   if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ t: 'cancel', id: item.id }));
   announce(`${item.name} cancelled.`);
 }
@@ -687,7 +718,7 @@ function retryTransfer(item) {
 function failActiveTransfers(reason) {
   for (const item of transfers.values()) {
     if (item.status === 'active' || item.status === 'queued') {
-      if (item.dir === 'recv') item.chunks = [];
+      if (item.dir === 'recv') dropReceived(item);
       setItemStatus(item, 'failed');
     }
   }

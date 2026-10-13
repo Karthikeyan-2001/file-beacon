@@ -68,14 +68,15 @@ this empirically: kill `server.js` mid-transfer and the transfer completes.
 
 ## Chunking & backpressure
 
-- Files are sliced with `File.slice(offset, offset + 64 KiB)` and each slice is
-  read with `.arrayBuffer()` just before sending — the sender never holds more
-  than one chunk (plus the channel's internal buffer) in memory, so
-  multi-hundred-MB files don't freeze the tab.
-- Backpressure: before each chunk, if `dc.bufferedAmount > 1 MiB` the send loop
-  awaits the `bufferedamountlow` event (`bufferedAmountLowThreshold = 256 KiB`).
-  This keeps memory flat and never overruns the SCTP buffer. A 20-second stall
-  on that wait fails the transfer instead of hanging forever.
+- Files are read forward with `File.stream()` and re-cut into 256 KiB messages
+  (clamped to the negotiated `sctp.maxMessageSize`), so disk reads overlap with
+  sends and the sender never holds the whole file in memory.
+- Backpressure: before each chunk, if `dc.bufferedAmount > 8 MiB` the send loop
+  awaits the `bufferedamountlow` event (`bufferedAmountLowThreshold = 4 MiB`).
+  This keeps SCTP saturated without overrunning Chrome's ~16 MiB send buffer.
+  A 20-second stall on that wait fails the transfer instead of hanging forever.
+- Progress UI repaints at most every 150 ms rather than once per chunk, so the
+  DOM work doesn't compete with the transfer on phones.
 - **Ordered channel, sequential queue** (documented tradeoff): an unordered
   channel with per-chunk sequence headers can reduce head-of-line blocking, but
   on a single SCTP association it does not increase throughput, and it forces
@@ -84,8 +85,9 @@ this empirically: kill `server.js` mid-transfer and the transfer completes.
   messages, so the receiver just appends buffers. Multiple files are therefore
   queued **sequentially per direction** (both peers can still send to each
   other simultaneously — each direction has its own queue).
-- Receive side: chunks accumulate in an array and become a `Blob` at the end,
-  which the browser may spill to disk. True streaming-to-disk via the File
+- Receive side: chunks accumulate in an array and are folded into a `Blob`
+  every 16 MiB, moving them out of the JS heap into the browser's blob store
+  (which may spill to disk); the parts become one `Blob` at the end. True streaming-to-disk via the File
   System Access API is the documented stretch goal; the current approach keeps
   Firefox/Safari compatibility.
 - Completion is acknowledged (`received` control message) so the sender's
@@ -98,7 +100,7 @@ JSON (text frames):   {t:'meta', id, name, size, mime}   file starts
                       {t:'done', id}                      sender finished
                       {t:'received', id}                  receiver ack → sender shows complete
                       {t:'cancel', id}                    either side aborts
-Binary frames:        64 KiB ArrayBuffer chunks of the current file
+Binary frames:        ArrayBuffer chunks (up to 256 KiB) of the current file
 ```
 
 ## NAT traversal
