@@ -26,7 +26,11 @@ const SPILL_BYTES = 16 * 1024 * 1024;
 const PROGRESS_INTERVAL_MS = 150;          // UI repaint cadence during a transfer
 const CONNECT_TIMEOUT_MS = 20 * 1000;
 const STALL_TIMEOUT_MS = 20 * 1000;
-const GRACE_MS = 6 * 1000; // recovery window for a transient 'disconnected'
+const GRACE_MS = 6 * 1000; // recovery window for a transient 'disconnected' during the handshake
+// Once linked, a dead path is usually a phone's Wi-Fi napping or switching
+// networks, not the other device leaving. Keep trying for this long.
+const RECOVERY_MS = 2 * 60 * 1000;
+const RECOVERY_RETRY_MS = 10 * 1000;       // ICE restart cadence while recovering
 const RTC_CONFIG = {
   iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }],
 };
@@ -55,6 +59,12 @@ let pendingCandidates = [];
 let connectTimer = null;
 let graceTimer = null;
 let ttlTimer = null;
+let recovering = false;       // linked, but the path dropped and we're trying to restore it
+let recoveryTimer = null;
+let session = null;           // { code, token } proves this device to the server on rejoin
+let reopening = false;        // a signaling reconnect is in flight
+let wakeLock = null;
+let wakeLockPending = false;
 
 let sendQueue = [];           // transfer items waiting to be sent
 let sending = null;           // item currently being sent
@@ -78,6 +88,32 @@ function setState(next, label) {
     connected: 'session', disconnected: 'dead', error: 'dead',
   }[next];
   if (show) views[show].hidden = false;
+  syncWakeLock();
+}
+
+// An Android screen timeout puts the phone's network to sleep, which takes the
+// peer connection with it. Hold the screen on while a session is live. The
+// browser drops the lock whenever the tab is hidden, and the API only exists on
+// HTTPS or localhost; without it we rely on recovery alone.
+async function syncWakeLock() {
+  const wanted = ['hosting', 'connecting', 'connected'].includes(appState) &&
+    document.visibilityState === 'visible';
+  if (!wanted) {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    return;
+  }
+  if (wakeLock || wakeLockPending || !('wakeLock' in navigator)) return;
+  wakeLockPending = true;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    lock.addEventListener('release', () => { if (wakeLock === lock) wakeLock = null; });
+    wakeLock = lock;
+  } catch {
+    // Denied (low battery, for instance). Not worth surfacing.
+  } finally {
+    wakeLockPending = false;
+  }
+  if (appState === 'disconnected' || appState === 'error' || appState === 'idle') syncWakeLock();
 }
 
 let lastAnnounce = '';
@@ -157,6 +193,8 @@ async function openSignaling() {
         // Only fatal if we were mid-pairing; once WebRTC is up the socket is optional.
         if (appState === 'hosting' || appState === 'joining' || appState === 'connecting') {
           fail('Lost the signaling connection before the peers could link.');
+        } else if (appState === 'connected' && ws === sock) {
+          reopenSignaling(); // not needed right now, but an ICE restart would need it
         }
       };
       ws = sock;
@@ -172,6 +210,23 @@ function sig(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
+// Reconnect to our paired room after the socket dropped. Best effort: if the
+// server is unreachable the data channel carries on without it.
+async function reopenSignaling() {
+  if (!session || reopening) return;
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  reopening = true;
+  try {
+    const sock = await openSignaling();
+    if (session) sock.send(JSON.stringify({ t: 'rejoin', code: session.code, token: session.token }));
+    else { sock.onclose = null; sock.close(); if (ws === sock) ws = null; } // left while reconnecting
+  } catch {
+    // The retry tick or the next visibility change tries again.
+  } finally {
+    reopening = false;
+  }
+}
+
 function handleSignalMessage(msg) {
   switch (msg.t) {
     case 'created': {
@@ -185,6 +240,7 @@ function handleSignalMessage(msg) {
       }
       codeEl.dataset.code = msg.code;
       codeEl.setAttribute('aria-label', `Room code ${msg.code.split('').join(' ')}`);
+      session = { code: msg.code, token: msg.token };
       startTtlCountdown(msg.ttl);
       setState('hosting');
       announce(`Room ready. Your code is ${msg.code.split('').join(', ')}.`);
@@ -197,10 +253,18 @@ function handleSignalMessage(msg) {
       break;
     case 'joined': // guest side
       $('#peer-desc').textContent = (msg.peer && msg.peer.ua) || 'a device';
+      session = { code: $('#join-code').value.trim(), token: msg.token };
       startWebRTC(false);
       break;
     case 'signal':
       onRemoteSignal(msg.d);
+      break;
+    case 'rejoined':
+    case 'peer-back':
+      if (recovering) requestIceRestart(); // an earlier offer may have gone nowhere
+      break;
+    case 'rejoin-failed':
+      session = null; // room is gone; ICE can still recover by itself until the deadline
       break;
     case 'expired':
       cleanupPeer();
@@ -208,9 +272,10 @@ function handleSignalMessage(msg) {
       showGateError('That room expired before anyone joined. Start a new one.');
       break;
     case 'peer-left':
+      session = null;
       if (appState === 'connected') {
         // The data channel result is authoritative; ws notice is a fallback.
-        if (!dc || dc.readyState !== 'open') peerGone();
+        if (!dc || dc.readyState !== 'open' || recovering) peerGone();
       } else if (appState === 'connecting') {
         fail('The other device left during the handshake.');
       }
@@ -249,11 +314,17 @@ function startWebRTC(host) {
       clearTimeout(connectTimer);
       clearTimeout(graceTimer);
       graceTimer = null;
+      if (recovering) endRecovery();
     } else if (pc.connectionState === 'failed') {
+      if (appState === 'connected') {
+        beginRecovery();
+        requestIceRestart(); // ICE won't come back from 'failed' without a restart
+        return;
+      }
       clearTimeout(graceTimer);
-      if (appState === 'connected') peerGone();
-      else fail('Could not establish a direct connection. A restrictive network (symmetric NAT) may require a TURN relay, which this demo does not include.');
+      fail('Could not establish a direct connection. A restrictive network (symmetric NAT) may require a TURN relay, which this demo does not include.');
     } else if (pc.connectionState === 'disconnected') {
+      if (appState === 'connected') { beginRecovery(); return; }
       // 'disconnected' is often transient (a dropped packet burst, a Wi-Fi
       // handover). Give ICE a grace window to recover before giving up.
       if (graceTimer) return;
@@ -261,8 +332,7 @@ function startWebRTC(host) {
         graceTimer = null;
         if (!pc) return;
         if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-          if (appState === 'connected') peerGone();
-          else fail('The connection was lost during the handshake.');
+          fail('The connection was lost during the handshake.');
         }
       }, GRACE_MS);
     }
@@ -286,8 +356,73 @@ function startWebRTC(host) {
   }, CONNECT_TIMEOUT_MS);
 }
 
+// ------------------------------------------------------------- recovery
+// The path can die while both devices are still there: ride it out. The data
+// channel survives an ICE restart, so a mid-flight transfer simply resumes.
+function beginRecovery() {
+  if (recovering) return;
+  recovering = true;
+  setState('connected', 'Reconnecting');
+  announce('Connection interrupted. Trying to reconnect.');
+  armRecoveryDeadline();
+  recoveryTimer = setInterval(requestIceRestart, RECOVERY_RETRY_MS);
+}
+
+function armRecoveryDeadline() {
+  clearTimeout(graceTimer);
+  graceTimer = setTimeout(() => {
+    graceTimer = null;
+    if (recovering) peerGone();
+  }, RECOVERY_MS);
+}
+
+function endRecovery() {
+  recovering = false;
+  clearInterval(recoveryTimer);
+  recoveryTimer = null;
+  if (receiving) receiving.lastChunkAt = performance.now(); // the watchdog sat out the outage
+  setState('connected');
+  announce('Reconnected.');
+  reportConnectionType(); // the new path may differ, e.g. Wi-Fi to mobile data
+}
+
+function requestIceRestart() {
+  if (!pc) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { reopenSignaling(); return; } // 'rejoined' calls back here
+  if (isHost) sendRestartOffer();
+  else sig({ t: 'signal', d: { restart: true } }); // only the host offers, so the two never collide
+}
+
+async function sendRestartOffer() {
+  try {
+    // A previous offer whose answer never arrived blocks a new one.
+    if (pc.signalingState === 'have-local-offer') await pc.setLocalDescription({ type: 'rollback' });
+    if (pc.signalingState !== 'stable') return;
+    await pc.setLocalDescription(await pc.createOffer({ iceRestart: true }));
+    sig({ t: 'signal', d: { sdp: pc.localDescription } });
+  } catch {
+    // The retry tick tries again.
+  }
+}
+
+function onVisibleOrOnline() {
+  syncWakeLock();
+  if (appState !== 'connected' || document.visibilityState !== 'visible') return;
+  reopenSignaling();
+  if (recovering) {
+    armRecoveryDeadline(); // timers don't run while a phone sleeps, so don't let this one fire on wake
+    requestIceRestart();
+  }
+}
+document.addEventListener('visibilitychange', onVisibleOrOnline);
+window.addEventListener('online', onVisibleOrOnline);
+
 async function onRemoteSignal(d) {
   if (!pc || !d) return;
+  if (d.restart) {
+    if (isHost) sendRestartOffer();
+    return;
+  }
   try {
     if (d.sdp) {
       await pc.setRemoteDescription(new RTCSessionDescription(d.sdp));
@@ -303,6 +438,7 @@ async function onRemoteSignal(d) {
       else pendingCandidates.push(d.candidate);
     }
   } catch (err) {
+    if (appState === 'connected') return; // a late answer to a rolled-back restart; retried anyway
     fail('The WebRTC handshake failed.');
   }
 }
@@ -370,9 +506,9 @@ function wireDataChannel() {
 function peerGone() {
   failActiveTransfers('The connection dropped mid-transfer.');
   cleanupPeer();
-  $('#dead-text').textContent = 'The other device disconnected.';
+  $('#dead-text').textContent = 'The connection to the other device was lost.';
   setState('disconnected');
-  announce('The other device disconnected.');
+  announce('The connection to the other device was lost.');
 }
 
 function fail(text) {
@@ -388,9 +524,14 @@ function cleanupPeer() {
   clearTimeout(connectTimer);
   clearTimeout(graceTimer);
   graceTimer = null;
+  clearInterval(recoveryTimer);
+  recoveryTimer = null;
+  recovering = false;
+  session = null;
   stopTtlCountdown();
   if (dc) { try { dc.close(); } catch {} dc = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
+  sig({ t: 'leave' }); // the server holds paired rooms for a dropped socket, so say this is final
   if (ws) { ws.onclose = null; try { ws.close(); } catch {} ws = null; }
   sending = null;
   receiving = null;
@@ -504,10 +645,15 @@ async function sendFileBody(item) {
 function waitForDrain() {
   return new Promise((resolve, reject) => {
     if (!dc || dc.readyState !== 'open') { reject(new Error('channel-closed')); return; }
-    const timer = setTimeout(() => {
-      dc && dc.removeEventListener('bufferedamountlow', onLow);
-      reject(new Error('send-stalled'));
-    }, STALL_TIMEOUT_MS);
+    let timer;
+    const arm = () => {
+      timer = setTimeout(() => {
+        if (recovering) { arm(); return; } // nothing can drain until the path is back
+        dc && dc.removeEventListener('bufferedamountlow', onLow);
+        reject(new Error('send-stalled'));
+      }, STALL_TIMEOUT_MS);
+    };
+    arm();
     const onLow = () => {
       clearTimeout(timer);
       resolve();
@@ -617,7 +763,7 @@ function finalizeReceive(item) {
 
 // Watchdog: a receive that stops making progress fails instead of hanging.
 setInterval(() => {
-  if (receiving && receiving.status === 'active' &&
+  if (!recovering && receiving && receiving.status === 'active' &&
       performance.now() - receiving.lastChunkAt > STALL_TIMEOUT_MS) {
     const item = receiving;
     receiving = null;
