@@ -6,11 +6,13 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8787;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ROOM_TTL_MS = 5 * 60 * 1000;     // unpaired rooms expire after 5 minutes
+const ROOM_RECOVERY_MS = 3 * 60 * 1000; // paired rooms wait this long for a dropped socket
 const MAX_ROOMS = 4000;                // stay well under the 9000-code space
 const MAX_BAD_JOINS = 5;               // guesses per socket before disconnect
 const MAX_SIGNAL_PAYLOAD = 64 * 1024;  // SDP+ICE fit comfortably; files never come here
@@ -65,8 +67,12 @@ const server = http.createServer((req, res) => {
 });
 
 // --------------------------------------------------------------- rooms
-/** code -> { host, guest, timer } */
+/** code -> { host, guest, timer, paired, tokens: { host, guest } } */
 const rooms = new Map();
+
+function mintToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
 
 function mintCode() {
   for (let i = 0; i < 100; i++) {
@@ -119,11 +125,13 @@ wss.on('connection', (ws) => {
           timer: setTimeout(() => {
             destroyRoom(code, { t: 'expired' });
           }, ROOM_TTL_MS),
+          paired: false,
+          tokens: { host: mintToken(), guest: mintToken() },
         };
         rooms.set(code, room);
         ws.room = code;
         ws.info = sanitizeInfo(msg.info);
-        send(ws, { t: 'created', code, ttl: ROOM_TTL_MS });
+        send(ws, { t: 'created', code, ttl: ROOM_TTL_MS, token: room.tokens.host });
         break;
       }
 
@@ -132,7 +140,7 @@ wss.on('connection', (ws) => {
         const code = String(msg.code || '');
         if (!/^\d{4}$/.test(code)) { send(ws, { t: 'error', code: 'not-found' }); return; }
         const room = rooms.get(code);
-        if (!room || room.guest) {
+        if (!room || room.paired) {
           // Brute-forcing the 4-digit space gets a socket ~5 guesses, then a new
           // TCP+WS handshake. That prices out scanning 10k codes within a TTL.
           if (++ws.badJoins >= MAX_BAD_JOINS) {
@@ -144,11 +152,39 @@ wss.on('connection', (ws) => {
           return;
         }
         clearTimeout(room.timer); // paired rooms live until a peer leaves
+        room.paired = true;
         room.guest = ws;
         ws.room = code;
         ws.info = sanitizeInfo(msg.info);
-        send(ws, { t: 'joined', peer: room.host.info || null });
+        send(ws, { t: 'joined', peer: room.host.info || null, token: room.tokens.guest });
         send(room.host, { t: 'peer-joined', peer: ws.info || null });
+        break;
+      }
+
+      // A paired device whose socket dropped (screen off, network switch) comes
+      // back to keep relaying ICE restarts. The code alone can't do this: only
+      // the private token handed out at pairing proves it's the same device.
+      case 'rejoin': {
+        if (ws.room) return;
+        const code = String(msg.code || '');
+        const room = rooms.get(code);
+        const role = !room ? null
+          : msg.token === room.tokens.host ? 'host'
+          : msg.token === room.tokens.guest ? 'guest'
+          : null;
+        if (!role) { send(ws, { t: 'rejoin-failed' }); return; }
+        const stale = room[role];
+        if (stale) { stale.room = null; stale.terminate(); } // half-open socket the reaper hasn't caught
+        room[role] = ws;
+        ws.room = code;
+        if (room.host && room.guest) clearTimeout(room.timer);
+        send(ws, { t: 'rejoined' });
+        send(role === 'host' ? room.guest : room.host, { t: 'peer-back' });
+        break;
+      }
+
+      case 'leave': {
+        if (ws.room) destroyRoom(ws.room, { t: 'peer-left' });
         break;
       }
 
@@ -163,7 +199,16 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    if (ws.room) destroyRoom(ws.room, { t: 'peer-left' }); // codes are single-use
+    const code = ws.room;
+    const room = rooms.get(code);
+    if (!room) return;
+    if (!room.paired) { destroyRoom(code, { t: 'peer-left' }); return; } // codes are single-use
+    // Losing the socket doesn't mean the device left: the data channel doesn't
+    // depend on it. Hold the room so the device can rejoin; 'leave' ends it early.
+    if (room.host === ws) room.host = null;
+    if (room.guest === ws) room.guest = null;
+    clearTimeout(room.timer);
+    room.timer = setTimeout(() => destroyRoom(code, { t: 'peer-left' }), ROOM_RECOVERY_MS);
   });
 });
 

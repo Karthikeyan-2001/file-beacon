@@ -53,9 +53,22 @@ channel opens, the WebSocket is irrelevant** — closing the server would not
 interrupt an in-flight transfer.
 
 Room rules: codes are random 4-digit numbers, held for 5 minutes awaiting a
-second peer, rejected once full, and destroyed the moment either peer
-disconnects (single-use). Rooms live in an in-memory `Map`; nothing is
-persisted anywhere.
+second peer, rejected once paired (single-use), and destroyed when a peer sends
+`{t:'leave'}`. Rooms live in an in-memory `Map`; nothing is persisted anywhere.
+
+## Staying connected
+
+Phones drop off the network when the screen times out or they switch networks,
+even though both devices are still there. So:
+
+- A screen wake lock is held while a session is live (HTTPS or localhost only;
+  the browser releases it while the tab is hidden).
+- When a linked connection reports `disconnected` or `failed`, the UI shows
+  **Reconnecting** and keeps trying for 2 minutes. The host sends an ICE restart
+  every 10 seconds, and the data channel survives it, so transfers resume.
+- ICE restarts need signaling, so a paired room outlives a dropped socket by 3
+  minutes. The device returns with `{t:'rejoin', code, token}`, using a private
+  token issued at pairing. The code alone can't re-enter a paired room.
 
 ## Why file data never touches the server
 
